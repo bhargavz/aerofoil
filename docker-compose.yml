@@ -17,7 +17,7 @@ services:
       # - USER_GUEST_NAME=guest
       # - USER_GUEST_PASSWORD=oerze!@8981
     volumes:
-      - /your/game/directory:/games
+      - K:\Games\Systems\Nintendo Switch\roms:/games
       - ./config:/app/config
       - ./data:/app/data
       - ./conversion-tmp:/app/conversion-tmp
