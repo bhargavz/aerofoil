@@ -546,18 +546,39 @@ def add_missing_apps_to_db():
                 .all()
             )
             existing_base_by_title = {}
-            existing_app_pairs = set()
             for app_row in existing_apps_rows:
                 title_fk = app_row.title_id
                 if title_fk not in existing_base_by_title:
                     existing_base_by_title[title_fk] = False
                 if app_row.app_type == APP_TYPE_BASE:
                     existing_base_by_title[title_fk] = True
-                existing_app_pairs.add((
-                    int(title_fk),
-                    str(app_row.app_id or ''),
-                    str(app_row.app_version or '0'),
-                ))
+
+            # The apps table enforces a GLOBAL unique constraint on
+            # (app_id, app_version), not scoped per title. Duplicate/orphaned
+            # Titles rows sharing the same title_id would otherwise each try
+            # to insert the same base/update/DLC pair. Pre-collect every
+            # candidate app_id for this batch and check existence globally.
+            batch_dlc_ids_by_title = {}
+            candidate_app_ids = set()
+            for row in title_rows:
+                title_id = row.title_id
+                if not title_id:
+                    continue
+                candidate_app_ids.add(title_id)
+                candidate_app_ids.add(title_id[:-3] + '800')
+                dlc_ids = titles_lib.get_all_existing_dlc(title_id)
+                batch_dlc_ids_by_title[title_id] = dlc_ids
+                candidate_app_ids.update(dlc_ids)
+
+            existing_global_pairs = set()
+            if candidate_app_ids:
+                existing_global_rows = (
+                    db.session.query(Apps.app_id, Apps.app_version)
+                    .filter(Apps.app_id.in_(candidate_app_ids))
+                    .all()
+                )
+                for app_id_val, app_version_val in existing_global_rows:
+                    existing_global_pairs.add((str(app_id_val or ''), str(app_version_val or '0')))
 
             for row in title_rows:
                 title_id = row.title_id
@@ -568,7 +589,8 @@ def add_missing_apps_to_db():
                     continue
 
                 # Add base game if not present at all (any base version).
-                if not existing_base_by_title.get(title_db_id, False):
+                base_pair = (str(title_id), "0")
+                if not existing_base_by_title.get(title_db_id, False) and base_pair not in existing_global_pairs:
                     new_base_app = Apps(
                         app_id=title_id,
                         app_version="0",
@@ -579,7 +601,7 @@ def add_missing_apps_to_db():
                     db.session.add(new_base_app)
                     apps_added += 1
                     existing_base_by_title[title_db_id] = True
-                    existing_app_pairs.add((int(title_db_id), str(title_id), "0"))
+                    existing_global_pairs.add(base_pair)
                     logger.debug(f'Added missing base app: {title_id}')
 
                 # Add missing update versions.
@@ -587,8 +609,8 @@ def add_missing_apps_to_db():
                 for version_info in title_versions:
                     version = str(version_info['version'])
                     update_app_id = title_id[:-3] + '800'
-                    pair = (int(title_db_id), str(update_app_id), version)
-                    if pair not in existing_app_pairs:
+                    pair = (str(update_app_id), version)
+                    if pair not in existing_global_pairs:
                         new_update_app = Apps(
                             app_id=update_app_id,
                             app_version=version,
@@ -598,19 +620,19 @@ def add_missing_apps_to_db():
                         )
                         db.session.add(new_update_app)
                         apps_added += 1
-                        existing_app_pairs.add(pair)
+                        existing_global_pairs.add(pair)
                         logger.debug(f'Added missing update app: {update_app_id} v{version}')
 
                 # Add missing DLC.
-                title_dlc_ids = titles_lib.get_all_existing_dlc(title_id)
+                title_dlc_ids = batch_dlc_ids_by_title.get(title_id, [])
                 for dlc_app_id in title_dlc_ids:
                     dlc_versions = titles_lib.get_all_app_existing_versions(dlc_app_id)
                     if not dlc_versions:
                         continue
                     for dlc_version in dlc_versions:
                         dlc_version_str = str(dlc_version)
-                        pair = (int(title_db_id), str(dlc_app_id), dlc_version_str)
-                        if pair in existing_app_pairs:
+                        pair = (str(dlc_app_id), dlc_version_str)
+                        if pair in existing_global_pairs:
                             continue
                         new_dlc_app = Apps(
                             app_id=dlc_app_id,
@@ -621,7 +643,7 @@ def add_missing_apps_to_db():
                         )
                         db.session.add(new_dlc_app)
                         apps_added += 1
-                        existing_app_pairs.add(pair)
+                        existing_global_pairs.add(pair)
                         logger.debug(f'Added missing DLC app: {dlc_app_id} v{dlc_version}')
 
                 if processed % _IDENTIFY_COMMIT_INTERVAL == 0:
