@@ -1,9 +1,16 @@
 version: "3"
+name: aerofoil
 
 services:
   aerofoil:
     container_name: aerofoil
     image: luketanti/aerofoil:latest
+    restart: unless-stopped
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        AEROFOIL_VERSION: v2.6.0-2-g8a152f5
     environment:
       # For write permission in config directory
       - PUID=1000
