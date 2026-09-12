@@ -2,6 +2,7 @@ __pycache__
 config
 data
 conversion-tmp
+logs
 
 # venv
 /bin
