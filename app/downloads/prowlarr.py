@@ -186,6 +186,18 @@ def _normalize_text(text):
     return text.strip()
 
 
+def normalize_release_name(name):
+    """Normalize a release/job name so Prowlarr titles and downloader job names compare equal."""
+    return _normalize_text(str(name or ""))
+
+
+def _is_excluded_release(result, exclude_names, exclude_urls):
+    if exclude_names and normalize_release_name(result.get("title")) in exclude_names:
+        return True
+    download_url = str(result.get("download_url") or "").strip()
+    return bool(exclude_urls and download_url and download_url in exclude_urls)
+
+
 def _has_version(text, version):
     if not version:
         return False
@@ -250,7 +262,7 @@ def _score_result(result, title_id=None, version=None):
     return score
 
 
-def pick_best_result(results, title_id=None, version=None, min_seeders=0, min_age_minutes=0, required_terms=None, required_terms_match="all", blacklist_terms=None, allowed_protocols=None, require_exact_version=False):
+def pick_best_result(results, title_id=None, version=None, min_seeders=0, min_age_minutes=0, required_terms=None, required_terms_match="all", blacklist_terms=None, allowed_protocols=None, require_exact_version=False, exclude_names=None, exclude_urls=None):
     filtered = filter_results(
         results,
         min_seeders=min_seeders,
@@ -259,6 +271,13 @@ def pick_best_result(results, title_id=None, version=None, min_seeders=0, min_ag
         required_terms_match=required_terms_match,
         blacklist_terms=blacklist_terms,
     )
+    if exclude_names or exclude_urls:
+        exclude_names = set(exclude_names or ())
+        exclude_urls = set(exclude_urls or ())
+        kept = [item for item in filtered if not _is_excluded_release(item, exclude_names, exclude_urls)]
+        if len(kept) != len(filtered):
+            logger.info("Skipped %s previously failed release(s).", len(filtered) - len(kept))
+        filtered = kept
     allowed = {str(item or "").strip().lower() for item in (allowed_protocols or []) if str(item or "").strip()}
     if allowed:
         filtered = [item for item in filtered if str(item.get("protocol") or "").strip().lower() in allowed]

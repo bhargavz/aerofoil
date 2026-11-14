@@ -23,7 +23,7 @@ from app.downloads.client import (
     remove_active_download,
     remove_completed_download,
 )
-from app.downloads.prowlarr import ProwlarrClient, filter_results, pick_best_result
+from app.downloads.prowlarr import ProwlarrClient, filter_results, normalize_release_name, pick_best_result
 from app.downloads.versioning import extract_internal_update_version
 from app.library import _ensure_unique_path, _sanitize_component, enqueue_cleanup_roots, enqueue_organize_paths
 from app.settings import load_settings
@@ -38,6 +38,7 @@ _state = {
     "completed": set(),
     "completed_identities": set(),
     "duplicates": [],
+    "failed_releases": [],  # releases whose download failed; never picked again
 }
 _state_loaded = False
 _DOWNLOADS_STATE_FILE = os.path.join(DATA_DIR, "downloads_state.json")
@@ -45,6 +46,8 @@ _DOWNLOADS_CONTENT_INDEX_FILE = os.path.join(DATA_DIR, "downloads_content.index.
 _SNAKE_PASS_BASE_TITLE_ID = "0100B3A017864000"
 _SNAKE_PASS_BASE_MIN_VERSION = 1
 _PENDING_MISSING_GRACE_SECONDS = 30
+_FAILED_RELEASES_LIMIT = 500
+_DEFAULT_MAX_FAILED_ATTEMPTS = 3
 
 
 def _get_prowlarr_timeout_seconds(prowlarr_cfg):
@@ -332,6 +335,9 @@ def _serialize_downloads_state_locked():
             if isinstance(identity, (tuple, list)) and len(identity) == 3
         ],
         "duplicates": [dict(entry) for entry in duplicates if isinstance(entry, dict)],
+        "failed_releases": [
+            dict(entry) for entry in (_state.get("failed_releases") or []) if isinstance(entry, dict)
+        ],
     }
 
 
@@ -375,6 +381,13 @@ def _load_downloads_state_locked():
                 _state["duplicates"] = [dict(entry) for entry in duplicates if isinstance(entry, dict)][-200:]
             else:
                 _state["duplicates"] = []
+            failed_releases = raw.get("failed_releases") if isinstance(raw, dict) else []
+            if isinstance(failed_releases, list):
+                _state["failed_releases"] = [
+                    dict(entry) for entry in failed_releases if isinstance(entry, dict)
+                ][-_FAILED_RELEASES_LIMIT:]
+            else:
+                _state["failed_releases"] = []
             try:
                 _state["last_run"] = float(raw.get("last_run") or 0.0)
             except Exception:
@@ -385,6 +398,7 @@ def _load_downloads_state_locked():
         _state["completed"] = set()
         _state["completed_identities"] = set()
         _state["duplicates"] = []
+        _state["failed_releases"] = []
     _state_loaded = True
     return
 
@@ -820,6 +834,143 @@ def dismiss_duplicate_download(duplicate_id, fingerprint=None):
     return False, "Duplicate entry not found."
 
 
+def _get_max_failed_attempts(downloads):
+    try:
+        value = int((downloads or {}).get("max_failed_attempts") or _DEFAULT_MAX_FAILED_ATTEMPTS)
+    except (TypeError, ValueError):
+        value = _DEFAULT_MAX_FAILED_ATTEMPTS
+    return max(1, min(value, 20))
+
+
+def _get_update_key_for_info(info):
+    title_id = str((info or {}).get("title_id") or "").strip().upper()
+    version = (info or {}).get("version")
+    if not title_id or version in (None, ""):
+        return None
+    try:
+        return f"{title_id}:{int(version)}"
+    except (TypeError, ValueError):
+        return None
+
+
+def _get_failed_release_exclusions():
+    """Return (normalized names, download urls) of every release that failed before."""
+    _ensure_downloads_state_loaded()
+    names = set()
+    urls = set()
+    with _state_lock:
+        for entry in _state.get("failed_releases") or []:
+            if not isinstance(entry, dict):
+                continue
+            name = normalize_release_name(entry.get("name"))
+            if name:
+                names.add(name)
+            url = str(entry.get("download_url") or "").strip()
+            if url:
+                urls.add(url)
+    return names, urls
+
+
+def _count_failed_attempts(update_key):
+    if not update_key:
+        return 0
+    _ensure_downloads_state_loaded()
+    with _state_lock:
+        return sum(
+            1 for entry in (_state.get("failed_releases") or [])
+            if isinstance(entry, dict) and entry.get("update_key") == update_key
+        )
+
+
+def _record_failed_release_locked(info, failed_item, reason):
+    name = str((failed_item or {}).get("name") or (info or {}).get("expected_name") or "").strip()
+    normalized_name = normalize_release_name(name)
+    if not normalized_name:
+        return False
+    update_key = _get_update_key_for_info(info)
+    failed_releases = _state.get("failed_releases")
+    if not isinstance(failed_releases, list):
+        failed_releases = []
+        _state["failed_releases"] = failed_releases
+    for entry in failed_releases:
+        if (
+            isinstance(entry, dict)
+            and normalize_release_name(entry.get("name")) == normalized_name
+            and entry.get("update_key") == update_key
+        ):
+            return False
+    failed_releases.append({
+        "name": name,
+        "download_url": (info or {}).get("download_url") or None,
+        "update_key": update_key,
+        "title_id": (info or {}).get("title_id"),
+        "version": (info or {}).get("version"),
+        "protocol": (info or {}).get("protocol"),
+        "reason": str(reason or "failed").strip() or "failed",
+        "failed_at": time.time(),
+    })
+    del failed_releases[:-_FAILED_RELEASES_LIMIT]
+    return True
+
+
+def _retry_failed_pending_downloads(downloads, snapshot):
+    """Forget downloads the client reports as failed so the next search picks another release.
+
+    The failed release is remembered (and excluded from later searches), the
+    failed job is removed from the downloader's history, and the AeroFoil queue
+    entry is dropped, which lets the same run search for that update again.
+    """
+    if not isinstance(snapshot, dict):
+        return 0
+    errors_by_protocol = snapshot.get("errors_by_protocol") or {}
+    with _state_lock:
+        pending_items = list((_state.get("pending") or {}).items())
+    removed_ids = set()
+    retried = 0
+    for key, info in pending_items:
+        if not isinstance(info, dict):
+            continue
+        protocol = str(info.get("protocol") or "").strip().lower()
+        if not protocol or errors_by_protocol.get(protocol):
+            continue
+        matches = _get_snapshot_matches(info, snapshot)
+        failed_item = matches["completed_match"]
+        if matches["active_match"] or not failed_item:
+            continue
+        if _normalize_terminal_queue_state(failed_item) != "failed":
+            continue
+        reason = failed_item.get("state_reason") or failed_item.get("status") or "failed"
+        item_id = failed_item.get("id") or failed_item.get("hash")
+        if item_id and item_id not in removed_ids:
+            client_cfg = (
+                _get_snapshot_protocol_bucket(snapshot, protocol, "completed_by_protocol").get("client_cfg")
+                or _get_protocol_client_cfg(downloads, protocol)
+            )
+            ok, message = remove_completed_download(protocol, client_cfg, item_id, delete_files=True)
+            if not ok:
+                logger.warning(
+                    "Could not remove failed %s job %s (%s); will retry it next run.",
+                    protocol,
+                    failed_item.get("name") or item_id,
+                    message,
+                )
+                continue
+            removed_ids.add(item_id)
+        with _state_lock:
+            _record_failed_release_locked(info, failed_item, reason)
+            _state["pending"].pop(key, None)
+            _state["completed"].discard(key)
+            _persist_downloads_state_locked()
+        retried += 1
+        logger.info(
+            "Download failed in %s, will search for a different release: %s (%s)",
+            protocol,
+            failed_item.get("name") or info.get("expected_name") or key,
+            reason,
+        )
+    return retried
+
+
 def _process_downloads(downloads, scan_cb=None, post_cb=None):
     prowlarr_cfg = downloads.get("prowlarr", {})
     if not prowlarr_cfg.get("url") or not prowlarr_cfg.get("api_key"):
@@ -836,6 +987,7 @@ def _process_downloads(downloads, scan_cb=None, post_cb=None):
     snapshot = _get_download_activity_snapshot(downloads)
     _restore_pending_from_active(downloads, snapshot=snapshot)
     _reconcile_missing_pending_downloads(downloads, snapshot)
+    _retry_failed_pending_downloads(downloads, snapshot)
 
     missing_updates = _get_missing_updates()
     if not missing_updates:
@@ -852,8 +1004,20 @@ def _process_downloads(downloads, scan_cb=None, post_cb=None):
     blacklist_terms = downloads.get("blacklist_terms") or []
     min_seeders = _get_torrent_min_seeders(downloads)
     min_age_minutes = _get_usenet_min_age_minutes(downloads)
+    max_failed_attempts = _get_max_failed_attempts(downloads)
 
     for update in missing_updates:
+        update_key = f"{update['title_id']}:{update['version']}"
+        failed_attempts = _count_failed_attempts(update_key)
+        if failed_attempts >= max_failed_attempts:
+            logger.info(
+                "Skipping %s v%s: %s release(s) already failed (limit %s). Use manual search to try another.",
+                update["title_id"],
+                update["version"],
+                failed_attempts,
+                max_failed_attempts,
+            )
+            continue
         _search_and_queue(
             client=client,
             update=update,
@@ -1042,6 +1206,7 @@ def queue_download_url(download_url, expected_name=None, update_only=False, dlc_
             expected_name=expected_name,
             protocol=resolved_protocol,
             client_type=client_cfg.get("type"),
+            download_url=download_url,
         )
         return True, "Queued download."
     return False, message
@@ -1076,6 +1241,7 @@ def _search_and_queue(
             return False, f"duplicate update: {update['title_id']} v{requested_version} already known (latest v{known_highest})"
 
     query_candidates = _build_queries(update)
+    excluded_names, excluded_urls = _get_failed_release_exclusions()
     result = None
     for query in query_candidates:
         results = client.search(query, indexer_ids=indexer_ids, categories=categories, limit=search_limit)
@@ -1090,6 +1256,8 @@ def _search_and_queue(
             blacklist_terms=blacklist_terms,
             allowed_protocols=allowed_protocols,
             require_exact_version=require_exact_version,
+            exclude_names=excluded_names,
+            exclude_urls=excluded_urls,
         )
         if result:
             break
@@ -1125,6 +1293,7 @@ def _search_and_queue(
             expected_name=result.get("title"),
             protocol=protocol,
             client_type=client_cfg.get("type"),
+            download_url=download_url,
         )
         logger.info(
             "Queued %s update %s v%s: %s",
@@ -1514,7 +1683,7 @@ def _reconcile_missing_pending_downloads(downloads, snapshot):
     return removed
 
 
-def _track_pending(key, update, item_id, expected_name=None, protocol=None, client_type=None):
+def _track_pending(key, update, item_id, expected_name=None, protocol=None, client_type=None, download_url=None):
     _ensure_downloads_state_loaded()
     normalized_id = _normalize_pending_item_id(item_id, protocol=protocol)
     with _state_lock:
@@ -1529,6 +1698,7 @@ def _track_pending(key, update, item_id, expected_name=None, protocol=None, clie
             "title_name": update.get("title_name"),
             "protocol": protocol,
             "client_type": client_type,
+            "download_url": download_url or None,
             "state": "queued",
             "state_reason": None,
             "last_seen_status": None,
