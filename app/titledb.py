@@ -336,6 +336,15 @@ def update_titledb_files(app_settings):
     if update_available:
         _write_latest_commit(latest_remote_commit)
 
+    # Merge the fresher overlay fork (borntohonk/titledb by default) over the artefact files.
+    # Never fatal: on failure the artefact data stays in place as before.
+    if TITLEDB_OVERLAY_REPO:
+        try:
+            from app import titledb_overlay
+            titledb_overlay.apply_overlay(app_settings)
+        except Exception as e:
+            logger.warning(f'TitleDB overlay from {TITLEDB_OVERLAY_REPO} failed: {e}')
+
 
 def update_titledb(app_settings):
     logger.info('Updating titledb...')
