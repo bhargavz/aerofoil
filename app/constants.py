@@ -23,7 +23,16 @@ ALEMBIC_CONF = os.path.join(ALEMBIC_DIR, 'alembic.ini')
 TITLEDB_DIR = os.path.join(DATA_DIR, 'titledb')
 TITLEDB_URL = 'https://github.com/blawar/titledb.git'
 TITLEDB_ARTEFACTS_URL = 'https://nightly.link/luketanti/aerofoil/workflows/region_titles/master/titledb.zip'
-TITLEDB_DESCRIPTIONS_BASE_URL = 'https://raw.githubusercontent.com/blawar/titledb/master'
+# Fresher titledb fork (weekly, same file layout as blawar/titledb). Its files are merged
+# over the nightly artefact above by app/titledb_overlay.py: newer versions, CNMTs and
+# region titles are added, nothing is removed. Set AEROFOIL_TITLEDB_OVERLAY_REPO to another
+# "owner/repo", or to an empty string to disable the overlay.
+TITLEDB_OVERLAY_REPO = os.environ.get('AEROFOIL_TITLEDB_OVERLAY_REPO', 'borntohonk/titledb').strip()
+TITLEDB_OVERLAY_BRANCH = os.environ.get('AEROFOIL_TITLEDB_OVERLAY_BRANCH', 'master').strip() or 'master'
+TITLEDB_DESCRIPTIONS_BASE_URL = (
+    f'https://raw.githubusercontent.com/{TITLEDB_OVERLAY_REPO}/{TITLEDB_OVERLAY_BRANCH}'
+    if TITLEDB_OVERLAY_REPO else 'https://raw.githubusercontent.com/blawar/titledb/master'
+)
 TITLEDB_DESCRIPTIONS_DEFAULT_FILE = 'US.en.json'
 TITLEDB_DEFAULT_FILES = [
     'cnmts.json',
@@ -114,6 +123,7 @@ DEFAULT_SETTINGS = {
         "required_terms": [],
         "required_terms_match": "all",
         "blacklist_terms": [],
+        "max_failed_attempts": 3,
         "search_prefix": "",
         "search_suffix": "",
         "search_char_replacements": [
