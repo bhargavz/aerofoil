@@ -7,6 +7,17 @@ from app.downloads.versioning import select_dlc_file_indices, select_update_file
 from app.settings import _normalize_download_settings
 
 
+from _state_isolation import isolate_downloads_state, restore_downloads_state
+
+
+def setUpModule():
+    isolate_downloads_state()
+
+
+def tearDownModule():
+    restore_downloads_state()
+
+
 class DownloadProtocolTests(unittest.TestCase):
     def test_normalize_result_preserves_usenet_protocol(self):
         item = {
