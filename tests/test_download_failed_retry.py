@@ -6,6 +6,17 @@ from app.downloads import manager
 from app.downloads.prowlarr import pick_best_result
 
 
+from _state_isolation import isolate_downloads_state, restore_downloads_state
+
+
+def setUpModule():
+    isolate_downloads_state()
+
+
+def tearDownModule():
+    restore_downloads_state()
+
+
 def _result(title, url, size=100):
     return {
         "title": title,

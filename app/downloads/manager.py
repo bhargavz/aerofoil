@@ -1973,6 +1973,10 @@ def _process_tracked_completed_item_locked(key, info, bucket):
                 )
                 if not ok:
                     logger.warning("Failed to remove duplicate completed %s item %s: %s", info.get("protocol"), matched_id, message)
+            if not retain_torrent:
+                # Nothing was imported, so the downloaded files are of no use; drop them
+                # instead of leaving a stale folder in the download directory.
+                _cleanup_refused_download(match.get("path"))
             return []
         logger.warning(
             "Matched completed download for pending key %s, but move failed. Keeping pending entry for retry: %s",
@@ -2124,6 +2128,40 @@ def _get_import_extension(src_path):
     return os.path.splitext(os.path.basename(str(src_path or "")))[1].lstrip(".")
 
 
+def _path_is_within(path, root):
+    """True when path is root or inside it. Paths on different drives are never nested.
+
+    os.path.commonpath raises ValueError for paths on different Windows drives
+    (e.g. F:\Downloads vs K:\Games), which used to make cleanup skip silently.
+    """
+    try:
+        path_abs = os.path.normcase(os.path.abspath(path))
+        root_abs = os.path.normcase(os.path.abspath(root))
+        if os.path.splitdrive(path_abs)[0] != os.path.splitdrive(root_abs)[0]:
+            return False
+        return os.path.commonpath([path_abs, root_abs]) == root_abs
+    except ValueError:
+        return False
+
+
+def _cleanup_refused_download(src_path):
+    """Delete a completed download that was refused (nothing imported). Never touches a library."""
+    if not src_path or not os.path.exists(src_path):
+        return
+    try:
+        library_paths = get_libraries_path() or []
+    except Exception as e:
+        logger.warning("Not removing refused download %s; library paths unavailable: %s", src_path, e)
+        return
+    if not library_paths:
+        return
+    if any(_path_is_within(src_path, lib) for lib in library_paths):
+        return
+    _cleanup_download_path(src_path, library_paths[0])
+    if not os.path.exists(src_path):
+        logger.info("Removed refused duplicate download: %s", src_path)
+
+
 def _cleanup_download_path(src_path, dest_root):
     if not src_path:
         return
@@ -2131,10 +2169,7 @@ def _cleanup_download_path(src_path, dest_root):
     src_root = src_path if src_is_dir else os.path.dirname(src_path)
     if not src_root or not os.path.exists(src_root):
         return
-    try:
-        if dest_root and os.path.commonpath([os.path.abspath(src_root), os.path.abspath(dest_root)]) == os.path.abspath(dest_root):
-            return
-    except Exception:
+    if dest_root and _path_is_within(src_root, dest_root):
         return
     try:
         if src_is_dir:

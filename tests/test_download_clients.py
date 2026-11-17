@@ -43,6 +43,17 @@ from app.downloads.usenet_client import add_nzb, list_active, list_completed, li
 from app.downloads.usenet_client import _restrict_job_to_matching_update_files
 
 
+from _state_isolation import isolate_downloads_state, restore_downloads_state
+
+
+def setUpModule():
+    isolate_downloads_state()
+
+
+def tearDownModule():
+    restore_downloads_state()
+
+
 def _normalize_fixture_path(value):
     text = str(value or "")
     if re.match(r"^[A-Za-z]:[\\/]", text) or "\\" in text:
