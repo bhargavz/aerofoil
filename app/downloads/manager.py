@@ -24,6 +24,7 @@ from app.downloads.client import (
     remove_completed_download,
 )
 from app.downloads.prowlarr import ProwlarrClient, filter_results, normalize_release_name, pick_best_result
+from app.downloads.update_selection import NZB_UPDATE_SELECTION_ERROR, TORRENT_UPDATE_SELECTION_ERROR
 from app.downloads.versioning import extract_internal_update_version
 from app.library import _ensure_unique_path, _sanitize_component, enqueue_cleanup_roots, enqueue_organize_paths
 from app.settings import load_settings
@@ -1306,6 +1307,29 @@ def _search_and_queue(
             result.get("title"),
         )
         return True, "Queued download."
+    if str(message or "").strip() in (NZB_UPDATE_SELECTION_ERROR, TORRENT_UPDATE_SELECTION_ERROR):
+        # The release holds no file for this update, so searching again would
+        # pick it every run. Remember it so the next search skips it.
+        with _state_lock:
+            if _record_failed_release_locked(
+                {
+                    "title_id": update.get("title_id"),
+                    "version": update.get("version"),
+                    "protocol": protocol,
+                    "download_url": download_url,
+                    "expected_name": result.get("title"),
+                },
+                {"name": result.get("title")},
+                message,
+            ):
+                _persist_downloads_state_locked()
+        logger.info(
+            "Blacklisted %s for %s v%s: %s",
+            result.get("title"),
+            update["title_id"],
+            update["version"],
+            message,
+        )
     return False, message
 
 
@@ -1623,6 +1647,10 @@ def _restore_pending_from_active(downloads, snapshot=None):
         }
         known_identities.update(completed_identities)
         for item in queued_items:
+            if _is_nzb_fetch_in_progress(item):
+                # AeroFoil itself is still waiting on this job's NZB; it tracks
+                # the job (or deletes it) once the fetch is done.
+                continue
             identity = _get_pending_identity(item)
             if identity and identity in known_identities:
                 continue
@@ -1686,10 +1714,26 @@ def _reconcile_missing_pending_downloads(downloads, snapshot):
     return removed
 
 
+def _is_nzb_fetch_in_progress(item):
+    status = str((item or {}).get("status") or "").strip().lower()
+    name = str((item or {}).get("name") or "").strip().lower()
+    return status == "grabbing" or name.startswith("trying to fetch nzb")
+
+
 def _track_pending(key, update, item_id, expected_name=None, protocol=None, client_type=None, download_url=None):
     _ensure_downloads_state_loaded()
     normalized_id = _normalize_pending_item_id(item_id, protocol=protocol)
     with _state_lock:
+        if normalized_id:
+            # The completed-download poller may have adopted this job as a
+            # "restored" entry while it was being queued; keep one record only.
+            for other_key, other in list(_state["pending"].items()):
+                if (
+                    other_key != key
+                    and isinstance(other, dict)
+                    and _normalize_pending_item_id(other.get("id") or other.get("hash"), protocol=protocol) == normalized_id
+                ):
+                    _state["pending"].pop(other_key, None)
         _state["pending"][key] = {
             "title_id": update["title_id"],
             "app_id": update.get("app_id"),
