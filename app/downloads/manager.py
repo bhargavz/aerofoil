@@ -24,6 +24,7 @@ from app.downloads.client import (
     remove_completed_download,
 )
 from app.downloads.prowlarr import ProwlarrClient, filter_results, normalize_release_name, pick_best_result
+from app.downloads.update_selection import NZB_UPDATE_SELECTION_ERROR, TORRENT_UPDATE_SELECTION_ERROR
 from app.downloads.versioning import extract_internal_update_version
 from app.library import _ensure_unique_path, _sanitize_component, enqueue_cleanup_roots, enqueue_organize_paths
 from app.settings import load_settings
@@ -878,11 +879,13 @@ def _count_failed_attempts(update_key):
     with _state_lock:
         return sum(
             1 for entry in (_state.get("failed_releases") or [])
-            if isinstance(entry, dict) and entry.get("update_key") == update_key
+            if isinstance(entry, dict)
+            and entry.get("update_key") == update_key
+            and not entry.get("stale")
         )
 
 
-def _record_failed_release_locked(info, failed_item, reason):
+def _record_failed_release_locked(info, failed_item, reason, stale=False):
     name = str((failed_item or {}).get("name") or (info or {}).get("expected_name") or "").strip()
     normalized_name = normalize_release_name(name)
     if not normalized_name:
@@ -908,6 +911,7 @@ def _record_failed_release_locked(info, failed_item, reason):
         "protocol": (info or {}).get("protocol"),
         "reason": str(reason or "failed").strip() or "failed",
         "failed_at": time.time(),
+        **({"stale": True} if stale else {}),
     })
     del failed_releases[:-_FAILED_RELEASES_LIMIT]
     return True
@@ -1303,6 +1307,29 @@ def _search_and_queue(
             result.get("title"),
         )
         return True, "Queued download."
+    if str(message or "").strip() in (NZB_UPDATE_SELECTION_ERROR, TORRENT_UPDATE_SELECTION_ERROR):
+        # The release holds no file for this update, so searching again would
+        # pick it every run. Remember it so the next search skips it.
+        with _state_lock:
+            if _record_failed_release_locked(
+                {
+                    "title_id": update.get("title_id"),
+                    "version": update.get("version"),
+                    "protocol": protocol,
+                    "download_url": download_url,
+                    "expected_name": result.get("title"),
+                },
+                {"name": result.get("title")},
+                message,
+            ):
+                _persist_downloads_state_locked()
+        logger.info(
+            "Blacklisted %s for %s v%s: %s",
+            result.get("title"),
+            update["title_id"],
+            update["version"],
+            message,
+        )
     return False, message
 
 
@@ -1620,6 +1647,10 @@ def _restore_pending_from_active(downloads, snapshot=None):
         }
         known_identities.update(completed_identities)
         for item in queued_items:
+            if _is_nzb_fetch_in_progress(item):
+                # AeroFoil itself is still waiting on this job's NZB; it tracks
+                # the job (or deletes it) once the fetch is done.
+                continue
             identity = _get_pending_identity(item)
             if identity and identity in known_identities:
                 continue
@@ -1683,10 +1714,26 @@ def _reconcile_missing_pending_downloads(downloads, snapshot):
     return removed
 
 
+def _is_nzb_fetch_in_progress(item):
+    status = str((item or {}).get("status") or "").strip().lower()
+    name = str((item or {}).get("name") or "").strip().lower()
+    return status == "grabbing" or name.startswith("trying to fetch nzb")
+
+
 def _track_pending(key, update, item_id, expected_name=None, protocol=None, client_type=None, download_url=None):
     _ensure_downloads_state_loaded()
     normalized_id = _normalize_pending_item_id(item_id, protocol=protocol)
     with _state_lock:
+        if normalized_id:
+            # The completed-download poller may have adopted this job as a
+            # "restored" entry while it was being queued; keep one record only.
+            for other_key, other in list(_state["pending"].items()):
+                if (
+                    other_key != key
+                    and isinstance(other, dict)
+                    and _normalize_pending_item_id(other.get("id") or other.get("hash"), protocol=protocol) == normalized_id
+                ):
+                    _state["pending"].pop(other_key, None)
         _state["pending"][key] = {
             "title_id": update["title_id"],
             "app_id": update.get("app_id"),
@@ -1960,6 +2007,9 @@ def _process_tracked_completed_item_locked(key, info, bucket):
     if not moved_match_paths:
         if _is_duplicate_reason(move_reason):
             _track_duplicate_locked(info, match, move_reason, key=key)
+            # Remember the release: its name only carries a marketing version, so the
+            # next search would otherwise pick (and download) the same old release again.
+            _record_failed_release_locked(info, match, move_reason, stale=True)
             _state["pending"].pop(key, None)
             _state["completed"].add(key)
             identity = _get_pending_identity(match) or _get_pending_identity(info)
@@ -1977,6 +2027,33 @@ def _process_tracked_completed_item_locked(key, info, bucket):
                 # Nothing was imported, so the downloaded files are of no use; drop them
                 # instead of leaving a stale folder in the download directory.
                 _cleanup_refused_download(match.get("path"))
+            return []
+        if not retain_torrent and _is_unimportable_reason(move_reason):
+            match_path = str(match.get("path") or "").strip()
+            if not info.get("extract_attempted") and _extract_archives(match_path):
+                info["extract_attempted"] = True
+                _persist_downloads_state_locked()
+                logger.info("Extracted archives in %s; will import on the next check.", match_path)
+                return []
+            info["extract_attempted"] = True
+            logger.warning(
+                "Giving up on completed download for %s (%s); blacklisting the release and searching again.",
+                key,
+                move_reason,
+            )
+            _record_failed_release_locked(info, match, move_reason)
+            _state["pending"].pop(key, None)
+            _state["completed"].discard(key)
+            if matched_id:
+                ok, message = remove_completed_download(
+                    str(info.get("protocol") or "").strip().lower(),
+                    bucket["client_cfg"],
+                    matched_id,
+                )
+                if not ok:
+                    logger.warning("Failed to remove unimportable %s item %s: %s", info.get("protocol"), matched_id, message)
+            _cleanup_refused_download(match_path)
+            _persist_downloads_state_locked()
             return []
         logger.warning(
             "Matched completed download for pending key %s, but move failed. Keeping pending entry for retry: %s",
@@ -2132,7 +2209,7 @@ def _path_is_within(path, root):
     """True when path is root or inside it. Paths on different drives are never nested.
 
     os.path.commonpath raises ValueError for paths on different Windows drives
-    (e.g. F:\Downloads vs K:\Games), which used to make cleanup skip silently.
+    (e.g. F:/Downloads vs K:/Games), which used to make cleanup skip silently.
     """
     try:
         path_abs = os.path.normcase(os.path.abspath(path))
@@ -2402,6 +2479,78 @@ def _move_completed(item, update_info=None, copy_files=False):
     else:
         moved_result, _ = _move_completed_with_reason(item, update_info=update_info)
     return moved_result
+
+
+_UNIMPORTABLE_REASONS = ("no importable files", "no update file found")
+_ARCHIVE_SUFFIXES = (".rar", ".zip", ".7z")
+
+
+def _is_unimportable_reason(reason):
+    text = str(reason or "").strip().lower()
+    return any(text.startswith(prefix) for prefix in _UNIMPORTABLE_REASONS)
+
+
+def _find_7z():
+    override = os.environ.get("AEROFOIL_7Z")
+    if override and os.path.isfile(override):
+        return override
+    found = shutil.which("7z") or shutil.which("7z.exe")
+    if found:
+        return found
+    for candidate in (r"C:\Program Files\7-Zip\7z.exe", r"C:\Program Files (x86)\7-Zip\7z.exe"):
+        if os.path.isfile(candidate):
+            return candidate
+    return None
+
+
+def _first_archive_volumes(folder):
+    archives = []
+    for name in sorted(os.listdir(folder)):
+        lower = name.lower()
+        if not lower.endswith(_ARCHIVE_SUFFIXES):
+            continue
+        # Only the first volume of a multi-part RAR (name.part01.rar / name.rar).
+        part = re.search(r"\.part(\d+)\.rar$", lower)
+        if part and int(part.group(1)) != 1:
+            continue
+        archives.append(os.path.join(folder, name))
+    return archives
+
+
+def _extract_archives(path):
+    """Extract RAR/ZIP/7z archives found in a completed download folder, in place.
+
+    Returns True when at least one archive extracted cleanly.
+    """
+    folder = path if os.path.isdir(path or "") else os.path.dirname(path or "")
+    if not folder or not os.path.isdir(folder):
+        return False
+    archives = _first_archive_volumes(folder)
+    if not archives:
+        return False
+    seven_zip = _find_7z()
+    if not seven_zip:
+        logger.warning("Archives found in %s, but 7-Zip is not installed; cannot extract.", folder)
+        return False
+    import subprocess
+
+    extracted = False
+    for archive in archives:
+        try:
+            proc = subprocess.run(
+                [seven_zip, "x", "-y", "-aos", f"-o{folder}", archive],
+                capture_output=True,
+                text=True,
+                timeout=1800,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Extracting %s failed: %s", archive, exc)
+            continue
+        if proc.returncode == 0:
+            extracted = True
+        else:
+            logger.warning("Extracting %s failed (7z exit %s): %s", archive, proc.returncode, (proc.stderr or proc.stdout or "").strip()[-300:])
+    return extracted
 
 
 def _is_duplicate_reason(reason):

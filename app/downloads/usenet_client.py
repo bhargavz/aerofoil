@@ -1,4 +1,5 @@
 import os
+import re
 import logging
 import time
 import hashlib
@@ -395,6 +396,28 @@ def _delete_job(url, api_key, nzo_id, timeout_seconds=15, delete_files=False):
     return True
 
 
+
+# SABnzbd lists a job's files only after its URL grabber has fetched the NZB,
+# which can take 10+ seconds. Deleting the job before that wastes the fetch, and
+# some indexers (nzb.life) refuse to serve the same NZB again for 24 hours.
+SAB_FILE_POLL_ATTEMPTS = 90
+
+_SWITCH_CONTENT_SUFFIXES = (".nsp", ".nsz", ".xci", ".xcz")
+_PACKED_ARCHIVE_RE = re.compile(r"\.(rar|r\d{2,3}|zip|7z(\.\d{3})?|\d{3})$", re.IGNORECASE)
+
+
+def _is_packed_release(file_names):
+    """True when the NZB only carries archives (often with obfuscated names).
+
+    The update/DLC inside cannot be identified before download, so the whole
+    job is kept; the files are extracted and checked when the download completes.
+    """
+    names = [str(name or "").strip().lower() for name in (file_names or [])]
+    if any(name.endswith(_SWITCH_CONTENT_SUFFIXES) for name in names):
+        return False
+    return any(_PACKED_ARCHIVE_RE.search(name) for name in names)
+
+
 def _restrict_job_to_matching_update_files(
     url,
     api_key,
@@ -406,6 +429,7 @@ def _restrict_job_to_matching_update_files(
 ):
     files = poll_update_file_names(
         lambda: _get_job_files(url, api_key, nzo_id, timeout_seconds=timeout_seconds),
+        attempts=SAB_FILE_POLL_ATTEMPTS,
         sleep_fn=time.sleep,
     )
     if not files:
@@ -419,6 +443,9 @@ def _restrict_job_to_matching_update_files(
         exclude_russian=exclude_russian,
     )
     if not keep_indices:
+        if _is_packed_release(file_names):
+            logger.info("SABnzbd job %s is packed in archives; keeping all files for extraction after download.", nzo_id)
+            return True, None
         return False, NZB_UPDATE_SELECTION_ERROR
 
     keep_set = set(keep_indices)
@@ -443,6 +470,7 @@ def _restrict_job_to_matching_dlc_files(
 ):
     files = poll_update_file_names(
         lambda: _get_job_files(url, api_key, nzo_id, timeout_seconds=timeout_seconds),
+        attempts=SAB_FILE_POLL_ATTEMPTS,
         sleep_fn=time.sleep,
     )
     if not files:
@@ -454,6 +482,9 @@ def _restrict_job_to_matching_dlc_files(
         exclude_russian=exclude_russian,
     )
     if not keep_indices:
+        if _is_packed_release(file_names):
+            logger.info("SABnzbd job %s is packed in archives; keeping all files for extraction after download.", nzo_id)
+            return True, None
         return False, NZB_DLC_SELECTION_ERROR
 
     keep_set = set(keep_indices)
