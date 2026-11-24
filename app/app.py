@@ -6195,6 +6195,50 @@ def delete_save_api(title_id, save_id=None):
     }, message='Save backup deleted successfully.')
 
 
+def _library_base_choice_subquery(app_version_num_expr):
+    """Per title: whether any BASE version is owned, the highest owned BASE
+    version, and the highest known BASE version."""
+    return (
+        db.session.query(
+            Apps.title_id.label('title_fk'),
+            func.max(case((Apps.owned.is_(True), 1), else_=0)).label('has_owned_base'),
+            func.max(
+                case((Apps.owned.is_(True), app_version_num_expr), else_=-1)
+            ).label('max_owned_base_version'),
+            func.max(app_version_num_expr).label('max_base_version'),
+        )
+        .filter(Apps.app_type == APP_TYPE_BASE)
+        .group_by(Apps.title_id)
+        .subquery()
+    )
+
+
+def _library_base_row_condition(base_choice_subquery, app_version_num_expr):
+    """Keep one BASE row per title in the library listing.
+
+    titledb can list several BASE versions for one title (e.g. a v0 base and
+    a v65536 base dump with the first patch built in). Listing each of them
+    showed an owned title twice, with the unowned version flagged "Missing".
+    Pick the highest owned BASE version, or the highest known one when none
+    is owned.
+    """
+    sub = base_choice_subquery
+    return and_(
+        Apps.app_type == APP_TYPE_BASE,
+        or_(
+            and_(
+                sub.c.has_owned_base == 1,
+                Apps.owned.is_(True),
+                app_version_num_expr == sub.c.max_owned_base_version,
+            ),
+            and_(
+                func.coalesce(sub.c.has_owned_base, 0) == 0,
+                app_version_num_expr == sub.c.max_base_version,
+            ),
+        ),
+    )
+
+
 @app.route('/api/titles', methods=['GET'])
 @access_required('shop')
 def get_all_titles_api():
@@ -6240,6 +6284,7 @@ def get_all_titles_api():
         .group_by(Apps.title_id)
         .subquery()
     )
+    base_choice_subquery = _library_base_choice_subquery(app_version_num_expr)
     update_status_subquery = (
         db.session.query(
             Apps.title_id.label('title_fk'),
@@ -6343,12 +6388,13 @@ def get_all_titles_api():
         .join(Titles, Apps.title_id == Titles.id)
         .outerjoin(size_subquery, size_subquery.c.app_pk == Apps.id)
         .outerjoin(base_status_subquery, base_status_subquery.c.title_fk == Titles.id)
+        .outerjoin(base_choice_subquery, base_choice_subquery.c.title_fk == Titles.id)
         .outerjoin(update_status_subquery, update_status_subquery.c.title_fk == Titles.id)
         .outerjoin(dlc_agg_subquery, dlc_agg_subquery.c.dlc_app_id == Apps.app_id)
         .outerjoin(dlc_completion_subquery, dlc_completion_subquery.c.title_fk == Titles.id)
         .filter(
             or_(
-                Apps.app_type == APP_TYPE_BASE,
+                _library_base_row_condition(base_choice_subquery, app_version_num_expr),
                 and_(
                     Apps.app_type == APP_TYPE_DLC,
                     app_version_num_expr == dlc_agg_subquery.c.max_version
